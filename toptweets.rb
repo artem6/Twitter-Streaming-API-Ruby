@@ -84,60 +84,93 @@ class StreamingJsonData < StreamingData
 
 end
 
-class Tweet
-
-	attr_accessor :id, :text, :createdAt, :retweetId
-
-	def initialize (jsonData)
-		#we only store the parts that we need for this example
-		@id = jsonData['id_str']
-		@text = jsonData['text']
-
-		if jsonData['created_at']
-			@createdAt = Time.parse(jsonData['created_at'])
-		else
-			@createdAt = Time.now
-		end
-
-		if jsonData['retweeted_status']
-			@retweetId = jsonData['retweeted_status']['id_str']
-		else
-			@retweetId = nil
-		end
-	end
-
-end
-
 class TopTweetCounter
 
-	attr_accessor :tweets
+	attr_accessor :tweets, :retweets
 
 	def initialize (duration)
-		@tweets = {}
-		@number = 10
+		@tweets = {}		# {id: [count, text], id: [count, text], ..}
+		@retweets = []		# [ [id, time], [id, time], ...]
+		
+		@topList = []		# [ id, id, ...]
+		@listLength = 10
+		@minOfTop = 0
+
 		@duration = duration
 	end
 
-	#make sure the tweet data contains the needed info
-	def checkTweet (jsonData)	
-		if not jsonData['id_str'] then return false end
-		if not jsonData['created_at'] then return false end
-		if not jsonData['retweeted_status'] then return false end
-		if not jsonData['retweeted_status']['id_str'] then return false end
-		if not jsonData['retweeted_status']['text'] then return false end
-		return true
+	def getTopList
+		cleanOldTweets
+		@topList.sort! {|a,b| @tweets[b][0] <=> @tweets[a][0]}
 	end
+
+	#see if the tweet should be added to our top 10 list
+	def addToList(id)
+		if (@tweets[id][0] == @minOfTop + 1 and @topList.find_index(id) == nil)
+
+			#add it to the list
+			@topList.push id
+
+			#find the smallest element
+			smallest = @topList.min_by {|a| @tweets[a][0]}
+
+			#find the new lowest element
+			if @topList.length < @listLength 
+				@minOfTop = 0
+			elsif @topList.length > @listLength 
+				#@topList = @topList[0 .. @listLength-1]
+				@topList.slice! (@topList.find_index smallest)
+				smallest = @topList.min_by {|a| @tweets[a][0]}
+				@minOfTop = @tweets[smallest][0]
+			else
+				puts smallest
+				@minOfTop = @tweets[smallest][0]
+			end
+		end
+	end
+
+	#see if the tweet should be removed from our top 10 list
+	def removeFromList(id)
+		if ( @tweets[id] and @tweets[id][0] == @minOfTop - 1 and @topList.find_index(id) )
+
+			#remove this element
+			@topList.slice! @topList.find_index(id)
+
+			#find the largest element not yet on the list
+			largest = 0
+			largestId = nil
+			@tweets.each do |key, value|
+				if ( value[0] > largest ) and ( @topList.find { |a| a == key} == nil )
+					largest = value[0]
+					largestId = key
+				end
+			end
+
+			#add the largest to the list
+			@topList.push largestId
+
+			#find the new lowest element
+			smallest = @topList.min_by {|a| @tweets[a][0]}
+			@minOfTop = @tweets[smallest][0]
+		end
+	end	
 
 	#adds a single tweet from json
 	def addTweet (jsonData)
-		if checkTweet jsonData
-			#save some memory
-			jsonData.delete('text')
-			jsonData['retweeted_status'].delete('created_at')
+		if jsonData['retweeted_status']
 
-			#store both the retweet and the original tweet
-			@tweets[jsonData['id_str']] = Tweet.new(jsonData)
-			@tweets[jsonData['retweeted_status']['id_str']] = Tweet.new(jsonData['retweeted_status'])
+			#is the current original tweet in our list?
+			if @tweets[jsonData['retweeted_status']['id_str']]
+				@tweets[jsonData['retweeted_status']['id_str']][0] += 1
+			else
+				@tweets[jsonData['retweeted_status']['id_str']] = [1, jsonData['retweeted_status']['text']]
+			end
+
+			#add the retweet to our list
+			@retweets.push [jsonData['retweeted_status']['id_str'], Time.parse(jsonData['created_at'])]
+			
+			# check if the current tweet should be in the top list
+			addToList jsonData['retweeted_status']['id_str']
 		end
 	end
 
@@ -148,34 +181,25 @@ class TopTweetCounter
 		end
 	end
 
-	#returns an array of the top tweet ids by how many times they were retweeted 
-	def getTopTweets
-		#clean out old tweets that don't affect the count
-		cleanOldTweets
-
-		#start a new hash of top tweets
-		retweetCount = Hash.new(0)
-		
-		#count all the retweets
-		@tweets.each do |id, tweet|
-			if tweet.retweetId and tweet.createdAt > Time.now - @duration * 60
-				retweetCount[tweet.retweetId] += 1
-			end
-		end
-		
-		#sort and cut (our hash becomes an array)
-		topTweets = retweetCount.sort_by do |key,value| value * -1 end
-		topTweets = topTweets[0.. @number - 1]
-
-		#returns [[id, retweets], ...]
-		return topTweets
-	end
-
 	#removes all tweets older than the duration
 	def cleanOldTweets	
-		@tweets.each do |id, tweet|
-			if tweet.createdAt < Time.now - @duration * 60
-				@tweets.delete(id)
+		loop do
+			if @retweets == [] then break end
+
+			#check the closest retweet to expiring, if it didn't expire, no need to check other retweets
+			if @retweets[0][1] < Time.now - @duration * 60
+
+				#lower the count for the original tweet
+				@tweets[@retweets[0][0]][0] -= 1
+
+				# check if the expired retweet would push the tweet out of the top list
+				removeFromList @retweets.shift		
+
+				#if the original tweet falls to zero retweets, then delete it
+				if @tweets[@retweets[0][0]][0] == 0 then @tweets.delete(@retweets[0][0]) end
+
+			else
+				break
 			end
 		end
 	end
@@ -209,23 +233,19 @@ class HTTPRequest
 
 end
 
-def tweetPrinter(topTweets, allTweets)
-
+def tweetPrinter(topTweets, tweets)
 	#clear the screen
 	puts "\e[H\e[2J"
 
-	topTweets.each do |key, value|
+	#tweets is [ [id, [retweets, text]], ...]
+	topTweets.each do |value|
 		#clean the text so that it displays nicely on one line
-		text = allTweets[key].text[0..40]
+		text = tweets[value][1][0..40]
 		text.delete! "\n"
-
-		puts value.to_s + " : " + text
+		puts tweets[value][0].to_s + " : " + text
 	end
 
 end
-
-
-
 
 #ask the user for the duration in minutes
 duration = 0
@@ -255,18 +275,18 @@ lastDisplay = Time.now
 
 #we read the data chunks from twitter as they come in
 twitterAPI.stream do |chunk|
-
 	#add the chunk that we pulled from twitter to our streaming data variable for processing
 	#note that we need this intermediary step since chunks may not have a complete block of json
-    streamedData.append chunk
-    
-    #add the tweets to our counter and clear the streamed data that we processed
+	streamedData.append chunk
+
+	#add the tweets to our counter and clear the streamed data that we processed
 	tweetCounter.addTweets streamedData.all
 	streamedData.clear
 
-    #print the top tweets
-    if lastDisplay < Time.now - 1
-    	lastDisplay = Time.now
-    	tweetPrinter tweetCounter.getTopTweets, tweetCounter.tweets
-    end
+	#print the top tweets
+	if lastDisplay < Time.now - 1
+		lastDisplay = Time.now
+		
+		tweetPrinter tweetCounter.getTopList, tweetCounter.tweets
+	end
 end
